@@ -1,0 +1,8 @@
+{
+  "naive_mb": 278.0,
+  "multistage_mb": 201.0,
+  "savings_mb": 77.0,
+  "savings_pct": 27.7,
+  "target_mb": 300.0,
+  "fits_target": true
+}
