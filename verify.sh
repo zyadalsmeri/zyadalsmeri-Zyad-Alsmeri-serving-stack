@@ -1,68 +1,235 @@
 #!/usr/bin/env bash
-# Green-check verifier for W2D3.
-# Pulls the image FRESH from the registry (removes any local copy first), runs it
-# with the hf-cache volume, polls /health, sends one completion, cleans up.
-# Prints exactly one line last: GREEN CHECK: PASS  or  GREEN CHECK: FAIL (<reason>)
+# Green-check verifier for W2D5 — Docker Compose + Secure /v1
 #
-# Usage:  IMAGE=<user>/aidc-serving:cpu-v1 ./verify.sh
+# Checks:
+# 1. compose.yaml and .env exist
+# 2. cpu-v2 image can be pulled fresh from Docker Hub
+# 3. Docker Compose starts the service
+# 4. Compose healthcheck reaches "healthy"
+# 5. /health returns 200 without API key
+# 6. /v1/models returns 401 without API key
+# 7. /v1/models returns 200 with the correct Bearer API key
+# 8. /v1/chat/completions returns a real authenticated completion
+#
+# Final line:
+# GREEN CHECK: PASS
+# or
+# GREEN CHECK: FAIL (<reason>)
+
 set -u
 
-IMAGE="${IMAGE:?set IMAGE=<user>/aidc-serving:cpu-v1}"
-NAME="aidc-verify-d3"
-PORT="${PORT:-8000}"
-TIMEOUT="${TIMEOUT:-420}"  # /health wait; first run downloads the model into the volume
-
-fail() { echo "GREEN CHECK: FAIL ($1)"; cleanup; exit 1; }
+TIMEOUT="${TIMEOUT:-420}"
+TMP_RESPONSE=""
 
 cleanup() {
-  docker rm -f "$NAME" >/dev/null 2>&1 || true
+  docker compose down >/dev/null 2>&1 || true
+
+  if [ -n "${TMP_RESPONSE:-}" ] && [ -f "$TMP_RESPONSE" ]; then
+    rm -f "$TMP_RESPONSE"
+  fi
 }
 
-# make sure we start clean
-cleanup
+fail() {
+  echo "GREEN CHECK: FAIL ($1)"
+  cleanup
+  exit 1
+}
 
-# 1. remove any local copy so the run genuinely comes from the registry
+
+# ---------------------------------------------------------
+# 1. Required files
+# ---------------------------------------------------------
+
+[ -f ".env" ] || fail ".env is missing"
+[ -f "compose.yaml" ] || fail "compose.yaml is missing"
+
+
+# ---------------------------------------------------------
+# 2. Load .env for verifier requests
+# ---------------------------------------------------------
+
+set -a
+source .env
+set +a
+
+[ -n "${IMAGE:-}" ] || fail "IMAGE is missing from .env"
+[ -n "${MODEL_ID:-}" ] || fail "MODEL_ID is missing from .env"
+[ -n "${HOST_PORT:-}" ] || fail "HOST_PORT is missing from .env"
+[ -n "${API_KEY:-}" ] || fail "API_KEY is missing or empty in .env"
+[ -n "${MAX_TOKENS:-}" ] || fail "MAX_TOKENS is missing from .env"
+
+TMP_RESPONSE="$(mktemp)"
+
+trap cleanup EXIT INT TERM
+
+
+# ---------------------------------------------------------
+# 3. Start clean
+# ---------------------------------------------------------
+
+echo "stopping existing Compose stack ..."
+docker compose down >/dev/null 2>&1 || true
+
+
+# ---------------------------------------------------------
+# 4. Fresh pull checkpoint
+# ---------------------------------------------------------
+
+echo "removing local image: $IMAGE ..."
 docker image rm "$IMAGE" >/dev/null 2>&1 || true
 
-# 2. pull fresh
 echo "pulling $IMAGE ..."
+
 if ! docker pull "$IMAGE" >/dev/null 2>&1; then
-  fail "docker pull failed (image not on registry, or not logged in for a private repo)"
+  fail "docker pull failed"
 fi
 
-# 3. run detached with the model cache volume (weights are NOT in the image)
-if ! docker run -d --name "$NAME" -p "${PORT}:8000" \
-      -v hf-cache:/home/app/.cache/huggingface "$IMAGE" >/dev/null 2>&1; then
-  fail "docker run failed (port ${PORT} in use, or the image will not start)"
+
+# ---------------------------------------------------------
+# 5. Start with Docker Compose
+# ---------------------------------------------------------
+
+echo "starting service with Docker Compose ..."
+
+if ! docker compose up -d >/dev/null 2>&1; then
+  fail "docker compose up failed"
 fi
 
-# 4. poll /health until healthy or timeout
-echo "waiting for /health (up to ${TIMEOUT}s) ..."
+
+# ---------------------------------------------------------
+# 6. Wait for Compose healthcheck
+# ---------------------------------------------------------
+
+echo "waiting for Compose healthcheck (up to ${TIMEOUT}s) ..."
+
 deadline=$(( $(date +%s) + TIMEOUT ))
 healthy=0
+
 while [ "$(date +%s)" -lt "$deadline" ]; do
-  code=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:${PORT}/health" 2>/dev/null || echo 000)
-  if [ "$code" = "200" ]; then healthy=1; break; fi
-  # if the container died, stop waiting and surface its logs reason
-  if [ -z "$(docker ps -q -f name=$NAME)" ]; then
-    echo "--- container logs (tail) ---"; docker logs --tail 20 "$NAME" 2>&1 || true
-    fail "container exited before /health came up"
+
+  CID="$(docker compose ps -q serving 2>/dev/null || true)"
+
+  if [ -z "$CID" ]; then
+    fail "serving container was not created"
   fi
+
+  RUNNING="$(docker inspect \
+    --format '{{.State.Running}}' \
+    "$CID" 2>/dev/null || true)"
+
+  if [ "$RUNNING" != "true" ]; then
+    echo "--- container logs ---"
+    docker compose logs --tail 30 serving 2>&1 || true
+    fail "serving container stopped"
+  fi
+
+  HEALTH="$(docker inspect \
+    --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' \
+    "$CID" 2>/dev/null || true)"
+
+  if [ "$HEALTH" = "healthy" ]; then
+    healthy=1
+    break
+  fi
+
   sleep 3
 done
-[ "$healthy" -eq 1 ] || fail "/health did not return 200 within ${TIMEOUT}s"
 
-# 5. one real completion through /v1
-resp=$(curl -s "http://localhost:${PORT}/v1/chat/completions" \
+[ "$healthy" -eq 1 ] || fail "service did not become healthy within ${TIMEOUT}s"
+
+
+# ---------------------------------------------------------
+# 7. /health must be open
+# ---------------------------------------------------------
+
+echo "checking /health without API key ..."
+
+CODE="$(curl -s \
+  -o /dev/null \
+  -w "%{http_code}" \
+  "http://localhost:${HOST_PORT}/health")"
+
+[ "$CODE" = "200" ] || fail "/health returned $CODE instead of 200"
+
+
+# ---------------------------------------------------------
+# 8. /v1/models must reject missing API key
+# ---------------------------------------------------------
+
+echo "checking /v1/models without API key ..."
+
+CODE="$(curl -s \
+  -o /dev/null \
+  -w "%{http_code}" \
+  "http://localhost:${HOST_PORT}/v1/models")"
+
+[ "$CODE" = "401" ] || fail "/v1/models without key returned $CODE instead of 401"
+
+
+# ---------------------------------------------------------
+# 9. /v1/models must accept correct API key
+# ---------------------------------------------------------
+
+echo "checking /v1/models with API key ..."
+
+CODE="$(curl -s \
+  -o /dev/null \
+  -w "%{http_code}" \
+  -H "Authorization: Bearer ${API_KEY}" \
+  "http://localhost:${HOST_PORT}/v1/models")"
+
+[ "$CODE" = "200" ] || fail "/v1/models with key returned $CODE instead of 200"
+
+
+# ---------------------------------------------------------
+# 10. Real authenticated completion
+# ---------------------------------------------------------
+
+echo "checking authenticated chat completion ..."
+
+CODE="$(curl -sS \
+  -o "$TMP_RESPONSE" \
+  -w "%{http_code}" \
+  "http://localhost:${HOST_PORT}/v1/chat/completions" \
   -H "Content-Type: application/json" \
-  -d '{"model":"Qwen/Qwen2.5-0.5B-Instruct","messages":[{"role":"user","content":"Say hi."}],"max_tokens":16}' 2>/dev/null)
+  -H "Authorization: Bearer ${API_KEY}" \
+  -d "{
+    \"model\":\"${MODEL_ID}\",
+    \"messages\":[
+      {
+        \"role\":\"user\",
+        \"content\":\"Say hi.\"
+      }
+    ],
+    \"max_tokens\":16
+  }")"
 
-echo "$resp" | grep -q '"chat.completion"' || fail "/v1/chat/completions did not return a chat.completion"
-echo "$resp" | grep -q '"content"' || fail "completion had no content field"
+[ "$CODE" = "200" ] || fail "/v1/chat/completions returned $CODE instead of 200"
 
+grep -q '"chat.completion"' "$TMP_RESPONSE" \
+  || fail "completion response has no chat.completion object"
+
+grep -q '"content"' "$TMP_RESPONSE" \
+  || fail "completion response has no content field"
+
+grep -q '"usage"' "$TMP_RESPONSE" \
+  || fail "completion response has no usage field"
+
+
+# ---------------------------------------------------------
+# Result
+# ---------------------------------------------------------
+
+echo
 echo "image: $IMAGE"
-echo "health: 200"
-echo "completion: ok"
+echo "compose: healthy"
+echo "health without key: 200"
+echo "models without key: 401"
+echo "models with key: 200"
+echo "authenticated completion: ok"
+
+trap - EXIT INT TERM
 cleanup
+
 echo "GREEN CHECK: PASS"
 exit 0
